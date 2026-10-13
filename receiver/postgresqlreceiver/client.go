@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"regexp"
 	"strconv"
 	"strings"
 	"text/template"
@@ -84,85 +83,40 @@ type postgreSQLClient struct {
 	closeFn func() error
 }
 
-var explainableStatements = map[string]struct{}{
-	"SELECT": {}, "TABLE": {}, "DELETE": {}, "INSERT": {},
-	"UPDATE": {}, "WITH": {}, "MERGE": {}, "VALUES": {},
-}
-
-// isExplainableQuery checks if a query can be explained.
-// Only DML statements (SELECT, INSERT, UPDATE, DELETE, etc.) can be explained.
-// This function strips leading SQL comments before checking.
-func isExplainableQuery(query string) bool {
-	q := strings.TrimSpace(query)
-	// Strip leading SQL comments
-	for {
-		if strings.HasPrefix(q, "--") {
-			if idx := strings.Index(q, "\n"); idx >= 0 {
-				q = strings.TrimSpace(q[idx+1:])
-				continue
-			}
-			return false
-		}
-		if strings.HasPrefix(q, "/*") {
-			if idx := strings.Index(q, "*/"); idx >= 0 {
-				q = strings.TrimSpace(q[idx+2:])
-				continue
-			}
-			return false
-		}
-		break
-	}
-	// Extract first word and check against allowlist
-	firstWord := q
-	if idx := strings.IndexAny(q, " \t\n\r("); idx >= 0 {
-		firstWord = q[:idx]
-	}
-	_, ok := explainableStatements[strings.ToUpper(firstWord)]
-	return ok
-}
+// capturedQueryPlanSQL reads a plan already recorded for a query by a server-side
+// plan store, keyed by query id.
+const capturedQueryPlanSQL = "/* otel-collector-ignore */ SELECT plan FROM pg_store_plans WHERE queryid::text = $1 ORDER BY calls DESC LIMIT 1"
 
 // explainQuery implements client.
 func (c *postgreSQLClient) explainQuery(query, queryID string, logger *zap.Logger) (string, error) {
-	if !isExplainableQuery(query) {
-		logger.Debug("skipping EXPLAIN for non-explainable query", zap.String("queryID", queryID))
+	// Read the plan already captured for this query rather than re-planning it here.
+	rawPlan, err := c.capturedQueryPlan(queryID)
+	if err != nil {
+		logger.Debug("could not read captured query plan", zap.String("queryID", queryID), zap.Error(err))
+		return "", nil
+	}
+	if rawPlan == "" {
 		return "", nil
 	}
 
-	normalizedQueryID := strings.ReplaceAll(queryID, "-", "_")
-
-	paramRegex := regexp.MustCompile(`\$\d+`)
-	matches := paramRegex.FindAllString(query, -1)
-
-	nulls := make([]string, len(matches))
-	for i := range nulls {
-		nulls[i] = "null"
-	}
-
-	//nolint:errcheck
-	defer c.client.Exec(fmt.Sprintf("/* otel-collector-ignore */ DEALLOCATE PREPARE otel_%s", normalizedQueryID))
-
-	nullsString := ""
-	if len(nulls) > 0 {
-		nullsString = "(" + strings.Join(nulls, ", ") + ")"
-	}
-	setPlanCacheMode := "/* otel-collector-ignore */ SET plan_cache_mode = force_generic_plan;"
-	prepareStatement := fmt.Sprintf("PREPARE otel_%s AS %s;", normalizedQueryID, query)
-	explainStatement := fmt.Sprintf("EXPLAIN(FORMAT JSON) EXECUTE otel_%s%s;", normalizedQueryID, nullsString)
-
-	wrappedDb := sqlquery.NewDbClient(sqlquery.DbWrapper{Db: c.client}, setPlanCacheMode+prepareStatement+explainStatement, logger, sqlquery.TelemetryConfig{})
-
-	result, err := wrappedDb.QueryRows(context.Background())
-	if err != nil {
-		logger.Error("failed to explain statement", zap.Error(err))
-		return "", err
-	}
-
-	plan, err := obfuscateSQLExecPlan(result[0]["QUERY PLAN"])
+	plan, err := obfuscateSQLExecPlan(rawPlan)
 	if err != nil {
 		logger.Error("failed to obfuscate explain plan", zap.Error(err), zap.String("queryID", queryID))
 		return "", err
 	}
 
+	return plan, nil
+}
+
+func (c *postgreSQLClient) capturedQueryPlan(queryID string) (string, error) {
+	var plan string
+	err := c.client.QueryRow(capturedQueryPlanSQL, queryID).Scan(&plan)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
 	return plan, nil
 }
 
